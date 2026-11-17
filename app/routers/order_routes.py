@@ -27,6 +27,7 @@ router = APIRouter(
 
 
 
+
 @router.post("/", response_model=OrderResponse, status_code=201)
 def create_new_order(
     order_data: OrderCreate,
@@ -38,12 +39,13 @@ def create_new_order(
 
     reserved_products = []
     order = None
+    inventory_outcome_unknown = False
 
     try:
         order_items = []
         products = {}
 
-        # Fetch product details and combine duplicate product quantities
+        # Fetch products and combine duplicate quantities
         for item in order_data.items:
             product = get_product(
                 product_id=item.product_id,
@@ -58,7 +60,7 @@ def create_new_order(
 
             products[product["product_id"]]["quantity"] += item.quantity
 
-        # Check stock and prepare order items
+        # Check available stock
         for product in products.values():
             if product["stock_quantity"] < product["quantity"]:
                 raise HTTPException(
@@ -66,7 +68,7 @@ def create_new_order(
                     detail=f"Insufficient stock for product {product['product_id']}"
                 )
 
-        # Preserve the customer's original order lines
+        # Prepare original order lines
         for item in order_data.items:
             product = products[item.product_id]
 
@@ -78,13 +80,13 @@ def create_new_order(
                 "quantity": item.quantity
             })
 
-        # Retrieve the customer's shipping address
+        # Retrieve shipping address
         shipping_address = get_user_address(
             address_id=order_data.shipping_address_id,
             access_token=access_token
         )
 
-        # Save the order before reserving inventory
+        # Save order before reserving stock
         order = create_order(
             db=db,
             user_id=user_id,
@@ -95,22 +97,34 @@ def create_new_order(
 
         # Reserve stock once per unique product
         for product in products.values():
-            reserve_product_stock(
-                product_id=product["product_id"],
-                quantity=product["quantity"],
-                order_reference=order.order_number
-            )
+            try:
+                reserve_product_stock(
+                    product_id=product["product_id"],
+                    quantity=product["quantity"],
+                    order_reference=order.order_number
+                )
 
-            reserved_products.append(product)
+                reserved_products.append(product)
+
+            except HTTPException as exc:
+                # A double network timeout means reservation outcome is unknown
+                if (
+                    exc.status_code == 503
+                    and isinstance(exc.detail, str)
+                    and "result is unknown" in exc.detail
+                ):
+                    inventory_outcome_unknown = True
+
+                raise
 
         return order
 
     except Exception as error:
         db.rollback()
 
-        # Restore products successfully reserved before a failure
         restoration_failed = False
 
+        # Restore products whose reservations were confirmed
         if order is not None:
             for product in reversed(reserved_products):
                 try:
@@ -122,23 +136,28 @@ def create_new_order(
                 except Exception:
                     restoration_failed = True
 
-            # Mark the order cancelled only after successful compensation
-            if not restoration_failed:
+            # Do not cancel an order when inventory outcome is unknown
+            if not inventory_outcome_unknown and not restoration_failed:
                 try:
                     db.query(Order).filter(
                         Order.id == order.id
                     ).update({"status": "CANCELLED"})
+
                     db.commit()
+
                 except Exception:
                     db.rollback()
                     restoration_failed = True
 
-        if restoration_failed:
+        # Require manual reconciliation for uncertain inventory operations
+        if inventory_outcome_unknown or restoration_failed:
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Order reservation failed and inventory compensation "
-                    "needs recovery"
+                    f"Order {order.order_number if order else 'not created'} "
+                    "requires inventory recovery. Its reservation outcome "
+                    "could not be safely confirmed. Do not retry by creating "
+                    "a new order until inventory has been reconciled."
                 )
             )
 

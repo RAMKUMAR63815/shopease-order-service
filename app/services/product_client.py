@@ -13,7 +13,7 @@ def get_product(
 ):
     # Build the Product Catalog API URL
     url = (
-        settings.PRODUCT_SERVICE_URL.rstrip("/") #rstrip("/") is a Python string method that removes / characters from the end (right side) of a string.
+        settings.PRODUCT_SERVICE_URL.rstrip("/")
         + f"/api/products/{product_id}"
     )
 
@@ -73,7 +73,6 @@ def get_product(
     }
 
 
-
 # Send internal inventory requests to Product Catalog
 def update_product_inventory(
     product_id: int,
@@ -112,54 +111,61 @@ def update_product_inventory(
         "remarks": f"Order {action}"
     }
 
-    try:
-        # Send authenticated internal request
-        response = httpx.post(
-            url,
-            json=payload,
-            headers={
-                "X-Service-Token": settings.INTERNAL_SERVICE_TOKEN
-            },
-            timeout=5.0
-        )
+    headers = {
+        "X-Service-Token": settings.INTERNAL_SERVICE_TOKEN
+    }
 
-        response.raise_for_status()
-
-        return response.json()
-
-    except httpx.HTTPStatusError as exc:
-        status_code = exc.response.status_code
-
+    # Retry once if the network response is lost
+    for attempt in range(2):
         try:
-            detail = exc.response.json().get(
-                "detail",
-                "Inventory operation failed"
+            response = httpx.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=5.0
             )
-        except ValueError:
-            detail = "Inventory operation failed"
 
-        if status_code == 409:
+            response.raise_for_status()
+
+            return response.json()
+
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+
+            try:
+                detail = exc.response.json().get(
+                    "detail",
+                    "Inventory operation failed"
+                )
+            except ValueError:
+                detail = "Inventory operation failed"
+
+            if status_code in (409, 404):
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=detail
+                )
+
             raise HTTPException(
-                status_code=409,
-                detail=detail
+                status_code=502,
+                detail="Product Catalog inventory operation failed"
             )
 
-        if status_code == 404:
+        except httpx.RequestError:
+            # Retry with the SAME reference ID.
+            # Product Catalog idempotency prevents duplicate stock changes.
+            if attempt == 0:
+                continue
+
+            # Both attempts failed, so the final inventory result is unknown.
             raise HTTPException(
-                status_code=404,
-                detail=detail
+                status_code=503,
+                detail=(
+                    f"Inventory {action} result is unknown for order "
+                    f"{order_reference}. Manual inventory reconciliation "
+                    "may be required."
+                )
             )
-
-        raise HTTPException(
-            status_code=502,
-            detail="Product Catalog inventory operation failed"
-        )
-
-    except httpx.RequestError:
-        raise HTTPException(
-            status_code=503,
-            detail="Product Catalog Service is unavailable"
-        )
 
 
 # Reserve product stock for an order
